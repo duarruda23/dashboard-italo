@@ -1,0 +1,115 @@
+{
+  "name": "[Italo] Meta Ads - Sync Insights (6h)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Sync Meta Ads → Supabase\n\nRoda a cada 6 horas e puxa insights por campanha dos últimos 7 dias (com `time_increment=1`, uma linha por dia). Upsert por `(date, campaign_id)`, então dados intradia são atualizados e dias antigos consolidados.\n\n**Variáveis de ambiente do n8n:**\n- `META_AD_ACCOUNT_ID` → só o número, sem `act_` (ex: 1234567890)\n- `META_ACCESS_TOKEN` → token de sistema/longa duração com permissão `ads_read`\n- `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY`\n\n**Backfill inicial:** troque `date_preset` para `maximum` (ou use `time_range`), execute manualmente 1x e volte para `last_7d`.",
+        "height": 400,
+        "width": 400
+      },
+      "id": "b2000000-0000-0000-0000-000000000001",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-160, -220]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "b2000000-0000-0000-0000-000000000002",
+      "name": "A cada 6 horas",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [280, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v23.0/act_{{ $env.META_AD_ACCOUNT_ID }}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "level", "value": "campaign" },
+            { "name": "fields", "value": "campaign_id,campaign_name,spend,impressions,clicks,ctr,cpm,cpc" },
+            { "name": "time_increment", "value": "1" },
+            { "name": "date_preset", "value": "last_7d" },
+            { "name": "limit", "value": "500" },
+            { "name": "access_token", "value": "={{ $env.META_ACCESS_TOKEN }}" }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "responseContainsNextURL",
+              "nextURL": "={{ $response.body.paging?.next }}",
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next }}"
+            }
+          }
+        }
+      },
+      "id": "b2000000-0000-0000-0000-000000000003",
+      "name": "Buscar Insights Meta",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [500, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Achata as páginas da Graph API em linhas para o Supabase\nconst rows = [];\nfor (const item of $input.all()) {\n  const data = item.json.data || [];\n  for (const r of data) {\n    rows.push({\n      date: r.date_start,\n      campaign_id: String(r.campaign_id),\n      campaign_name: r.campaign_name || null,\n      spend: Number(r.spend || 0),\n      impressions: Number(r.impressions || 0),\n      clicks: Number(r.clicks || 0),\n      ctr: r.ctr != null ? Number(r.ctr) : null,\n      cpm: r.cpm != null ? Number(r.cpm) : null,\n      cpc: r.cpc != null ? Number(r.cpc) : null,\n      synced_at: new Date().toISOString(),\n    });\n  }\n}\n\nif (rows.length === 0) {\n  return [];\n}\n\n// Envia tudo em um único upsert em lote\nreturn [{ json: { rows } }];"
+      },
+      "id": "b2000000-0000-0000-0000-000000000004",
+      "name": "Formatar Linhas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/meta_insights?on_conflict=date,campaign_id",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Prefer", "value": "resolution=merge-duplicates" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.rows) }}",
+        "options": {}
+      },
+      "id": "b2000000-0000-0000-0000-000000000005",
+      "name": "Upsert Insights",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 0]
+    }
+  ],
+  "connections": {
+    "A cada 6 horas": {
+      "main": [[{ "node": "Buscar Insights Meta", "type": "main", "index": 0 }]]
+    },
+    "Buscar Insights Meta": {
+      "main": [[{ "node": "Formatar Linhas", "type": "main", "index": 0 }]]
+    },
+    "Formatar Linhas": {
+      "main": [[{ "node": "Upsert Insights", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,119 @@
+{
+  "name": "[Italo] Hotmart Webhook - Todos os Eventos",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Webhook Hotmart (catch-all)\n\nRecebe TODOS os eventos de TODOS os produtos.\n\n**Configuração necessária (variáveis de ambiente do n8n):**\n- `SUPABASE_URL` → ex: https://xxxx.supabase.co\n- `SUPABASE_SERVICE_ROLE_KEY` → Service Role Key do Supabase\n- `HOTMART_HOTTOK` → Hottok exibido na tela de webhook da Hotmart (valida a origem)\n\n**Na Hotmart:** Ferramentas → Webhook (API e Notificações) → cadastrar a URL de produção deste webhook (versão 2.0.0) e marcar todos os eventos.\n\nFluxo:\n1. Salva o evento bruto em `hotmart_events` (nada se perde)\n2. Se for evento de compra, faz upsert em `sales`",
+        "height": 420,
+        "width": 400
+      },
+      "id": "a1000000-0000-0000-0000-000000000001",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-160, -220]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hotmart",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "a1000000-0000-0000-0000-000000000002",
+      "name": "Webhook Hotmart",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [280, 0],
+      "webhookId": "b7e3f7a2-4c1d-4e9a-9f2b-1a2b3c4d5e6f"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Valida o hottok da Hotmart e normaliza o evento\nconst item = $input.item.json;\nconst headers = item.headers || {};\nconst body = item.body || {};\n\nconst expected = $env.HOTMART_HOTTOK;\nconst received = headers['x-hotmart-hottok'];\nif (expected && received !== expected) {\n  throw new Error('Hottok inválido — evento descartado (possível requisição falsa)');\n}\n\nconst data = body.data || {};\nconst purchase = data.purchase || {};\nconst product = data.product || {};\n\nconst eventRow = {\n  event_id: body.id || null,\n  event: body.event || 'UNKNOWN',\n  version: body.version || null,\n  product_id: product.id ?? null,\n  product_name: product.name || null,\n  transaction: purchase.transaction || null,\n  payload: body,\n};\n\nreturn { json: { eventRow, body } };"
+      },
+      "id": "a1000000-0000-0000-0000-000000000003",
+      "name": "Validar e Normalizar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/hotmart_events?on_conflict=event_id",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Prefer", "value": "resolution=merge-duplicates" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.eventRow) }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-0000-0000-000000000004",
+      "name": "Salvar Evento Bruto",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Transforma eventos PURCHASE_* em registro de venda.\n// Eventos que não são de compra (ou sem transaction, ex: carrinho abandonado)\n// ficam apenas em hotmart_events.\nconst body = $('Validar e Normalizar').item.json.body;\nconst event = body.event || '';\n\nconst STATUS = {\n  PURCHASE_APPROVED: 'APPROVED',\n  PURCHASE_COMPLETE: 'COMPLETE',\n  PURCHASE_REFUNDED: 'REFUNDED',\n  PURCHASE_CHARGEBACK: 'CHARGEBACK',\n  PURCHASE_CANCELED: 'CANCELED',\n  PURCHASE_BILLET_PRINTED: 'BILLET_PRINTED',\n  PURCHASE_EXPIRED: 'EXPIRED',\n  PURCHASE_DELAYED: 'DELAYED',\n  PURCHASE_PROTEST: 'PROTEST',\n};\n\nconst data = body.data || {};\nconst purchase = data.purchase || {};\nconst product = data.product || {};\nconst buyer = data.buyer || {};\nconst origin = purchase.origin || {};\n\nif (!STATUS[event] || !purchase.transaction) {\n  return null; // não é venda — encerra este item aqui\n}\n\nconst toIso = (v) => (v ? new Date(v).toISOString() : undefined);\n\n// Atribuição: sck no padrão meta|CAMPAIGN_ID|ADSET_ID|AD_ID (ou sem o prefixo)\nconst src = origin.xcod || origin.src || undefined;\nconst sck = origin.sck || undefined;\nlet utm_campaign_id, utm_adset_id, utm_ad_id;\nif (sck) {\n  const parts = String(sck).split('|');\n  const p = parts[0].toLowerCase() === 'meta' ? parts.slice(1) : parts;\n  utm_campaign_id = p[0] || undefined;\n  utm_adset_id = p[1] || undefined;\n  utm_ad_id = p[2] || undefined;\n}\n\nconst isApproval = event === 'PURCHASE_APPROVED' || event === 'PURCHASE_COMPLETE';\nconst isRefund = event === 'PURCHASE_REFUNDED' || event === 'PURCHASE_CHARGEBACK';\n\nconst sale = {\n  transaction: purchase.transaction,\n  product_id: product.id,\n  product_name: product.name,\n  buyer_email: buyer.email,\n  buyer_name: buyer.name,\n  status: STATUS[event],\n  price: purchase.price?.value,\n  currency: purchase.price?.currency_value,\n  payment_type: purchase.payment?.type,\n  src,\n  sck,\n  utm_campaign_id,\n  utm_adset_id,\n  utm_ad_id,\n  ordered_at: toIso(purchase.order_date),\n  approved_at: isApproval ? toIso(purchase.approved_date || body.creation_date) : undefined,\n  refunded_at: isRefund ? toIso(body.creation_date) : undefined,\n};\n\n// Remove campos vazios para o upsert não sobrescrever dados já gravados com null\nfor (const k of Object.keys(sale)) {\n  if (sale[k] === undefined || sale[k] === null) delete sale[k];\n}\n\nreturn { json: { sale } };"
+      },
+      "id": "a1000000-0000-0000-0000-000000000005",
+      "name": "Mapear Venda",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/sales?on_conflict=transaction",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_ROLE_KEY }}" },
+            { "name": "Prefer", "value": "resolution=merge-duplicates" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.sale) }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-0000-0000-000000000006",
+      "name": "Upsert Venda",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1160, 0]
+    }
+  ],
+  "connections": {
+    "Webhook Hotmart": {
+      "main": [[{ "node": "Validar e Normalizar", "type": "main", "index": 0 }]]
+    },
+    "Validar e Normalizar": {
+      "main": [[{ "node": "Salvar Evento Bruto", "type": "main", "index": 0 }]]
+    },
+    "Salvar Evento Bruto": {
+      "main": [[{ "node": "Mapear Venda", "type": "main", "index": 0 }]]
+    },
+    "Mapear Venda": {
+      "main": [[{ "node": "Upsert Venda", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

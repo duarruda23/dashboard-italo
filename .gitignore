@@ -1,0 +1,20 @@
+# Dependências
+node_modules/
+
+# Build do Next.js
+dashboard/.next/
+dashboard/out/
+*.tsbuildinfo
+
+# SEGREDOS - nunca commitar
+.env
+.env.local
+.env*.local
+
+# Logs e temporários
+*.log
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
